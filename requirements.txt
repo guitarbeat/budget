@@ -1,0 +1,5 @@
+streamlit>=1.24.0
+pandas>=2.0.0
+plotly>=5.13.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.21.0  # Optional, but makes fuzzywuzzy much faster 

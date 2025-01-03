@@ -1,0 +1,604 @@
+import streamlit as st
+import pandas as pd
+from typing import Dict, List, Optional, Tuple, Any
+from fuzzywuzzy import fuzz
+
+# Constants
+REQUIRED_COLUMNS = ['Date', 'Amount']
+OPTIONAL_COLUMNS = ['Description']
+DATE_TOLERANCE_DAYS = 3
+DISCREPANCY_TYPES = {
+    'left_only': '🏦 In Bank Only',
+    'right_only': '📊 In Budget Only',
+    'amount_mismatch': '💰 Amount Mismatch',
+    'date_mismatch': '📅 Date Mismatch'
+}
+
+# Column Mapping Class
+class ColumnMapper:
+    def __init__(self):
+        self.required_cols = ['Date', 'Amount']
+        self.optional_cols = ['Description']
+        
+        # Known file format mappings
+        self.format_mappings = {
+            'apple_card': {
+                'Date': 'Transaction Date',
+                'Amount': 'Amount (USD)',
+                'Description': ['Description', 'Merchant']  # Will concatenate these
+            },
+            'ynab': {
+                'Date': 'Date',
+                'Amount': ['Inflow', 'Outflow'],  # Special handling for YNAB
+                'Description': ['Memo', 'Payee']  # Will concatenate these
+            }
+        }
+
+    def detect_file_format(self, df: pd.DataFrame) -> str:
+        """Detect the file format based on columns"""
+        columns = set(df.columns)
+        
+        if 'Transaction Date' in columns and 'Amount (USD)' in columns:
+            return 'apple_card'
+        elif 'Inflow' in columns and 'Outflow' in columns:
+            return 'ynab'
+        return 'unknown'
+
+    def display_available_columns(self, transaction_df: pd.DataFrame, budget_df: pd.DataFrame) -> None:
+        st.subheader("Available Columns")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("Bank Transaction Columns:")
+            st.write(sorted(transaction_df.columns.tolist()))
+            format_type = self.detect_file_format(transaction_df)
+            st.info(f"Detected format: {format_type}")
+        
+        with col2:
+            st.write("Budget Columns:")
+            st.write(sorted(budget_df.columns.tolist()))
+            format_type = self.detect_file_format(budget_df)
+            st.info(f"Detected format: {format_type}")
+
+    def create_mapping_interface(self, transaction_df: pd.DataFrame, budget_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str], bool]:
+        st.subheader("Column Mapping")
+        st.info("Map your file columns to standard names. Multiple columns can be selected for combined fields.")
+        
+        # Detect file formats
+        transaction_format = self.detect_file_format(transaction_df)
+        budget_format = self.detect_file_format(budget_df)
+        
+        # Create mappings with detected formats
+        transaction_mapping = self._create_single_mapping(
+            transaction_df,
+            "Bank Transaction",
+            self.format_mappings.get(transaction_format, {})
+        )
+        
+        budget_mapping = self._create_single_mapping(
+            budget_df,
+            "Budget",
+            self.format_mappings.get(budget_format, {})
+        )
+        
+        has_ynab_amount = budget_format == 'ynab'
+        
+        if st.button("Save Column Mappings"):
+            missing_cols = []
+            missing_cols.extend(self._validate_mapping(transaction_mapping, "Bank Transactions"))
+            
+            if not has_ynab_amount:
+                missing_cols.extend(self._validate_mapping(budget_mapping, "Budget"))
+            
+            if missing_cols:
+                for msg in missing_cols:
+                    st.error(msg)
+                return None, None, False
+            
+            # Clean mappings
+            transaction_mapping = self._clean_mapping(transaction_mapping)
+            budget_mapping = self._clean_mapping(budget_mapping)
+            
+            st.success("Column mappings saved! Proceed to Process Data tab.")
+            return transaction_mapping, budget_mapping, has_ynab_amount
+        
+        return None, None, False
+
+    def _create_single_mapping(
+        self,
+        df: pd.DataFrame,
+        mapping_name: str,
+        default_mappings: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        st.write(f"{mapping_name} Column Mapping:")
+        mapping = {}
+        cols = [""] + df.columns.tolist()
+        
+        for col in self.required_cols + self.optional_cols:
+            is_optional = col in self.optional_cols
+            default_value = default_mappings.get(col, "")
+            
+            # Handle multiple column mappings
+            if isinstance(default_value, list):
+                mapping[col] = st.multiselect(
+                    f"{col} Column{' (Optional)' if is_optional else ''} (can select multiple)",
+                    options=cols,
+                    default=[c for c in default_value if c in cols],
+                    help="Select one or more columns to combine"
+                )
+            else:
+                mapping[col] = st.selectbox(
+                    f"{col} Column{' (Optional)' if is_optional else ''}",
+                    options=cols,
+                    index=next((i for i, c in enumerate(cols) if c == default_value), 0)
+                )
+        
+        return mapping
+
+    def _clean_mapping(self, mapping: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean mapping by removing empty values and handling lists"""
+        cleaned = {}
+        for k, v in mapping.items():
+            if isinstance(v, list):
+                # Keep only non-empty values from lists
+                v = [x for x in v if x and x != ""]
+                if v:  # Only add if we have values
+                    cleaned[k] = v
+            elif v and v != "":
+                cleaned[k] = v
+        return cleaned
+
+    def _validate_mapping(self, mapping: Dict[str, Any], source_name: str) -> List[str]:
+        missing_cols = []
+        for col in self.required_cols:
+            value = mapping.get(col)
+            if not value or (isinstance(value, list) and not value):
+                missing_cols.append(f"Missing required column '{col}' in {source_name} mapping")
+        return missing_cols
+
+# Data Processing Functions
+def process_date_column(df: pd.DataFrame, date_col: str = 'Date') -> pd.DataFrame:
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    return df
+
+def process_amount_column(df: pd.DataFrame, amount_col: str = 'Amount') -> pd.DataFrame:
+    df = df.copy()
+    df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce').round(2)
+    return df
+
+def get_date_range_str(df: pd.DataFrame, date_col: str = 'Date') -> str:
+    try:
+        dates = pd.to_datetime(df[date_col])
+        return f"{dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}"
+    except Exception:
+        return "Date range unavailable"
+
+def process_ynab_amount(row: pd.Series) -> float:
+    try:
+        outflow = str(row.get('Outflow', '0')).replace('$', '').replace(',', '').strip()
+        inflow = str(row.get('Inflow', '0')).replace('$', '').replace(',', '').strip()
+        outflow = float(outflow) if outflow else 0
+        inflow = float(inflow) if inflow else 0
+        # YNAB format: positive for inflow (deposits), negative for outflow (charges)
+        return inflow - outflow  # This ensures charges are negative
+    except (ValueError, TypeError):
+        return 0.0
+
+def standardize_columns(df: pd.DataFrame, column_mapping: Dict[str, Any], invert_amounts: bool = False) -> pd.DataFrame:
+    df = df.copy()
+    
+    for target_col, source_cols in column_mapping.items():
+        if isinstance(source_cols, list):
+            # Combine multiple columns
+            if target_col == 'Amount':
+                # Special handling for YNAB-style amount columns
+                if 'Inflow' in source_cols and 'Outflow' in source_cols:
+                    df[target_col] = df.apply(process_ynab_amount, axis=1)
+                else:
+                    # For other multi-column amounts, sum them
+                    df[target_col] = df[source_cols].fillna(0).astype(float).sum(axis=1)
+            else:
+                # For description/text columns, concatenate with separator
+                df[target_col] = df[source_cols].fillna('').apply(lambda x: ' - '.join(filter(None, x)), axis=1)
+        else:
+            # Single column mapping
+            if target_col == 'Amount':
+                # Convert amount strings to float, handling currency symbols and commas
+                df[target_col] = df[source_cols].replace('[\$,]', '', regex=True).astype(float)
+            else:
+                df[target_col] = df[source_cols]
+    
+    # Apply amount inversion if requested
+    if invert_amounts and 'Amount' in df.columns:
+        df['Amount'] = -df['Amount']
+    
+    return df
+
+def find_matching_transactions(bank_row: pd.Series, budget_df: pd.DataFrame, date_tolerance: int = DATE_TOLERANCE_DAYS) -> pd.DataFrame:
+    bank_date = pd.to_datetime(bank_row['Date'])
+    bank_amount = float(bank_row['Amount'])
+    
+    date_window = budget_df[
+        (budget_df['Date'] >= bank_date - pd.Timedelta(days=date_tolerance)) &
+        (budget_df['Date'] <= bank_date + pd.Timedelta(days=date_tolerance))
+    ]
+    
+    exact_matches = date_window[abs(date_window['Amount'] - bank_amount) < 0.01]
+    
+    if not exact_matches.empty:
+        return exact_matches
+    
+    if 'Description' in bank_row and 'Memo' in budget_df.columns:
+        bank_desc = str(bank_row['Description']).lower()
+        
+        def desc_similarity(budget_desc):
+            return fuzz.ratio(bank_desc, str(budget_desc).lower())
+        
+        date_window['desc_match'] = date_window['Memo'].apply(desc_similarity)
+        potential_matches = date_window[date_window['desc_match'] >= 85]
+        
+        if not potential_matches.empty:
+            return potential_matches.sort_values('desc_match', ascending=False)
+    
+    return pd.DataFrame()
+
+def process_transaction_result(
+    bank_row: pd.Series,
+    matches: pd.DataFrame,
+    discrepancy_types: Dict[str, str]
+) -> Dict[str, Any]:
+    if matches.empty:
+        return {
+            'Date': bank_row['Date'],
+            'Amount': bank_row['Amount'],
+            'Description': bank_row.get('Description', ''),
+            'Status': discrepancy_types['left_only'],
+            'Match_Count': 0,
+            'Best_Match_Date': None,
+            'Best_Match_Description': None
+        }
+    
+    best_match = matches.iloc[0]
+    return {
+        'Date': bank_row['Date'],
+        'Amount': bank_row['Amount'],
+        'Description': bank_row.get('Description', ''),
+        'Status': '✅ Matched' if abs(best_match['Amount'] - bank_row['Amount']) < 0.01 else discrepancy_types['amount_mismatch'],
+        'Match_Count': len(matches),
+        'Best_Match_Date': best_match['Date'],
+        'Best_Match_Description': best_match.get('Memo', '')
+    }
+
+# UI Components
+def display_dataframe(df: pd.DataFrame, title: Optional[str] = None, height: int = 400) -> None:
+    if title:
+        st.subheader(title)
+    st.dataframe(df, use_container_width=True, height=height)
+
+def display_metrics(metrics: List[Tuple[str, Any, Optional[str]]], num_columns: int = 3) -> None:
+    cols = st.columns(num_columns)
+    for i, (label, value, delta) in enumerate(metrics):
+        with cols[i % num_columns]:
+            st.metric(label, value, delta)
+
+def create_date_range_filter(df: pd.DataFrame, date_col: str = 'Date') -> Tuple[pd.Timestamp, pd.Timestamp]:
+    df_dates = pd.to_datetime(df[date_col])
+    min_date = df_dates.min().date()
+    max_date = df_dates.max().date()
+    selected_dates = st.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    return pd.to_datetime(selected_dates[0]), pd.to_datetime(selected_dates[1])
+
+def create_amount_range_filter(df: pd.DataFrame, amount_col: str = 'Amount') -> Tuple[float, float]:
+    min_amount = float(df[amount_col].min())
+    max_amount = float(df[amount_col].max())
+    amount_range = st.slider(
+        "Amount Range",
+        min_value=min_amount,
+        max_value=max_amount,
+        value=(min_amount, max_amount)
+    )
+    return amount_range
+
+def display_df_preview(df: pd.DataFrame, title: str, show_columns: bool = True) -> None:
+    st.subheader(title)
+    if show_columns:
+        st.write("Columns:", sorted(df.columns.tolist()))
+    st.dataframe(df.head(), use_container_width=True)
+
+def setup_page():
+    st.set_page_config(
+        page_title="Transaction Reconciliation Tool",
+        page_icon="💰",
+        layout="wide"
+    )
+    st.markdown("""
+        <style>
+        .main { padding: 2rem; }
+        .stTabs [data-baseweb="tab-list"] { gap: 2rem; }
+        .stTabs [data-baseweb="tab"] { padding: 1rem; }
+        </style>
+    """, unsafe_allow_html=True)
+
+def render_sidebar():
+    with st.sidebar:
+        st.image("https://www.svgrepo.com/show/530438/bank.svg", width=100)
+        st.title("Navigation")
+        st.info("💡 This tool helps you reconcile transactions between different sources.")
+        
+        # Step Navigation
+        st.subheader("Steps")
+        steps = {
+            1: "📤 Upload Files",
+            2: "🗺️ Column Mapping",
+            3: "🔄 Process Data",
+            4: "📊 Results"
+        }
+        
+        for step_num, step_name in steps.items():
+            if st.button(f"{step_name}", key=f"nav_{step_num}"):
+                st.session_state.current_step = step_num
+        
+        # Status Indicators
+        st.divider()
+        st.subheader("Status")
+        if 'combined_transactions_df' in st.session_state:
+            st.success(f"✅ Transaction files loaded: {len(st.session_state.combined_transactions_df)} rows")
+        if 'budget_df' in st.session_state:
+            st.success(f"✅ Budget file loaded: {len(st.session_state.budget_df)} rows")
+        if 'column_mappings' in st.session_state:
+            st.success("✅ Column mappings configured")
+        
+        st.divider()
+        st.markdown("### About")
+        st.markdown("""
+            This tool allows you to:
+            - Upload multiple transaction files
+            - Compare with budget data
+            - Identify discrepancies
+            - Export results
+        """)
+
+# Main Application
+setup_page()
+
+if 'current_step' not in st.session_state:
+    st.session_state.current_step = 1
+if 'column_mapper' not in st.session_state:
+    st.session_state.column_mapper = ColumnMapper()
+
+render_sidebar()
+
+st.title("Transaction Reconciliation Tool")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📤 Upload Files", "🗺️ Column Mapping", "🔄 Process Data", "📊 Results"])
+
+with tab1:
+    st.header("Step 1: Upload Files")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Bank Transactions")
+        uploaded_transaction_files = st.file_uploader(
+            "Upload Transactions CSV Files",
+            type="csv",
+            accept_multiple_files=True,
+            help="Select one or more transaction CSV files to process"
+        )
+
+    with col2:
+        st.subheader("Budget Data")
+        uploaded_budget_file = st.file_uploader(
+            "Upload Budget CSV File",
+            type="csv",
+            help="Select your budget CSV file to compare against transactions",
+            key="budget_uploader"
+        )
+
+    if uploaded_transaction_files:
+        transaction_dfs = []
+        all_columns = set()
+        
+        with st.spinner("Processing transaction files..."):
+            for file in uploaded_transaction_files:
+                try:
+                    df = pd.read_csv(file)
+                    df['Source'] = file.name
+                    transaction_dfs.append(df)
+                    all_columns.update(df.columns)
+                except Exception as e:
+                    st.error(f"Error reading file {file.name}: {str(e)}")
+
+        if transaction_dfs:
+            combined_transactions_df = pd.concat(transaction_dfs, ignore_index=True, sort=False)
+            st.session_state.combined_transactions_df = combined_transactions_df
+            st.session_state.all_columns = sorted(list(all_columns))
+            
+            st.success(f"Successfully loaded {len(transaction_dfs)} files with {len(combined_transactions_df)} total transactions")
+            display_dataframe(combined_transactions_df, "Combined Transactions Data")
+            
+            metrics = [
+                ("Total Files", len(transaction_dfs), None),
+                ("Total Transactions", len(combined_transactions_df), None),
+                ("Date Range", get_date_range_str(combined_transactions_df), None)
+            ]
+            display_metrics(metrics)
+
+    if uploaded_budget_file:
+        try:
+            budget_df = pd.read_csv(uploaded_budget_file)
+            st.session_state.budget_df = budget_df
+            st.success(f"Successfully loaded budget file with {len(budget_df)} entries")
+            display_dataframe(budget_df, "Budget Data")
+        except Exception as e:
+            st.error(f"Error processing budget file: {str(e)}")
+
+with tab2:
+    st.header("Step 2: Column Mapping")
+    
+    if 'combined_transactions_df' not in st.session_state or 'budget_df' not in st.session_state:
+        st.warning("Please upload both transaction files and budget file in the Upload Files tab.")
+    else:
+        st.session_state.column_mapper.display_available_columns(
+            st.session_state.combined_transactions_df,
+            st.session_state.budget_df
+        )
+        
+        transaction_mapping, budget_mapping, has_ynab_amount = st.session_state.column_mapper.create_mapping_interface(
+            st.session_state.combined_transactions_df,
+            st.session_state.budget_df
+        )
+        
+        if transaction_mapping is not None:
+            st.session_state.column_mappings = {
+                'transaction_mapping': transaction_mapping,
+                'budget_mapping': budget_mapping,
+                'has_ynab_amount': has_ynab_amount
+            }
+
+with tab3:
+    st.header("Step 3: Process Data")
+    
+    if 'column_mappings' not in st.session_state:
+        st.warning("Please complete column mapping first.")
+    elif 'combined_transactions_df' not in st.session_state or 'budget_df' not in st.session_state:
+        st.warning("Please upload all required files first.")
+    else:
+        try:
+            with st.spinner("Processing data..."):
+                transaction_mapping = st.session_state.column_mappings['transaction_mapping']
+                budget_mapping = st.session_state.column_mappings['budget_mapping']
+                has_ynab_amount = st.session_state.column_mappings['has_ynab_amount']
+                
+                # Add invert amount controls
+                col1, col2 = st.columns(2)
+                with col1:
+                    invert_transaction_amounts = st.checkbox(
+                        "Invert Transaction Amounts",
+                        help="Check this if charges are showing as positive instead of negative"
+                    )
+                with col2:
+                    invert_budget_amounts = st.checkbox(
+                        "Invert Budget Amounts",
+                        help="Check this if budget amounts have incorrect signs"
+                    )
+                
+                standardized_transactions_df = st.session_state.combined_transactions_df.copy()
+                standardized_transactions_df = standardize_columns(
+                    standardized_transactions_df,
+                    transaction_mapping,
+                    invert_amounts=invert_transaction_amounts
+                )
+                
+                standardized_budget_df = st.session_state.budget_df.copy()
+                if has_ynab_amount:
+                    standardized_budget_df['Amount'] = standardized_budget_df.apply(process_ynab_amount, axis=1)
+                    budget_mapping['Amount'] = 'Amount'
+                
+                standardized_budget_df = standardize_columns(
+                    standardized_budget_df,
+                    budget_mapping,
+                    invert_amounts=invert_budget_amounts
+                )
+                
+                for df_name, df in [("Bank Transactions", standardized_transactions_df), ("Budget", standardized_budget_df)]:
+                    missing = [col for col in ['Date', 'Amount'] if col not in df.columns]
+                    if missing:
+                        raise ValueError(f"Missing required columns in {df_name}: {', '.join(missing)}")
+                
+                st.session_state.processed_data = {
+                    'transactions': standardized_transactions_df,
+                    'budget': standardized_budget_df
+                }
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    display_df_preview(standardized_transactions_df, "Processed Bank Transactions")
+                with col2:
+                    display_df_preview(standardized_budget_df, "Processed Budget Data")
+                
+                st.success("Data processing complete! View results in the Results tab.")
+        
+        except Exception as e:
+            st.error(f"Error processing data: {str(e)}")
+
+with tab4:
+    if 'processed_data' in st.session_state:
+        st.header("Step 4: Transaction Analysis")
+        
+        transactions_df = process_date_column(process_amount_column(st.session_state.processed_data['transactions'].copy()))
+        budget_df = process_date_column(process_amount_column(st.session_state.processed_data['budget'].copy()))
+        
+        date_tolerance = st.sidebar.slider(
+            "Date Matching Tolerance (days)",
+            min_value=0,
+            max_value=7,
+            value=DATE_TOLERANCE_DAYS,
+            help="Number of days to look for matching transactions"
+        )
+        
+        has_descriptions = ('Description' in transactions_df.columns and 'Memo' in budget_df.columns)
+        if has_descriptions:
+            st.sidebar.subheader("Matching Settings")
+            fuzzy_threshold = st.sidebar.slider(
+                "Description Matching Threshold",
+                min_value=50,
+                max_value=100,
+                value=85,
+                help="Higher values require more exact matches (100 = exact match)"
+            )
+        
+        results = []
+        for _, bank_row in transactions_df.iterrows():
+            matches = find_matching_transactions(bank_row, budget_df, date_tolerance)
+            results.append(process_transaction_result(bank_row, matches, DISCREPANCY_TYPES))
+        
+        results_df = pd.DataFrame(results)
+        
+        total_transactions = len(transactions_df)
+        total_matched = len(results_df[results_df['Status'] == '✅ Matched'])
+        total_missing = len(results_df[results_df['Status'] == DISCREPANCY_TYPES['left_only']])
+        
+        metrics = [
+            ("Total Bank Transactions", total_transactions, None),
+            ("Matched Transactions", total_matched, f"{(total_matched/total_transactions*100):.1f}% of total"),
+            ("Missing Entries", total_missing, f"{(total_missing/total_transactions*100):.1f}% of total")
+        ]
+        display_metrics(metrics)
+        
+        st.subheader("🔎 Filter Transactions")
+        status_filter = st.multiselect(
+            "Status",
+            options=sorted(results_df['Status'].unique()),
+            default=['🏦 In Bank Only']
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            amount_range = create_amount_range_filter(results_df)
+        with col2:
+            start_date, end_date = create_date_range_filter(results_df)
+        
+        filtered_df = results_df[
+            (results_df['Status'].isin(status_filter)) &
+            (results_df['Amount'].between(amount_range[0], amount_range[1])) &
+            (results_df['Date'].dt.date.between(start_date.date(), end_date.date()))
+        ].copy()
+        
+        st.subheader("📋 Transaction Analysis")
+        st.markdown(f"Showing **{len(filtered_df)}** transactions")
+        
+        for date in sorted(filtered_df['Date'].unique()):
+            date_df = filtered_df[filtered_df['Date'] == date]
+            with st.expander(f"📅 {date.strftime('%Y-%m-%d')} ({len(date_df)} transactions)"):
+                display_columns = ['Amount', 'Description', 'Status', 'Match_Count']
+                if 'Best_Match_Description' in date_df.columns:
+                    display_columns.extend(['Best_Match_Date', 'Best_Match_Description'])
+                display_dataframe(date_df[display_columns])
+    else:
+        st.info("Complete the data processing in previous tabs to view results.")
